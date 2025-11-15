@@ -290,35 +290,103 @@ while True:
     # =====================================================
 
     cur.execute("""
-        SELECT 
-            id, 
-            "senderRole",
-            "rejectReason",
-            status,
-            "createdAt",
-            "updatedAt"
-        FROM contract_cancel_requests
-        ORDER BY "updatedAt" DESC
-        LIMIT 1;
-    """)
+                SELECT id,
+                       "senderRole",
+                       "senderId",
+                       "rejectReason",
+                       status,
+                       "contractId",
+                       "createdAt",
+                       "updatedAt"
+                FROM contract_cancel_requests
+                ORDER BY "updatedAt" DESC LIMIT 1;
+                """)
 
     cancel = cur.fetchone()
 
     if cancel:
-        cancel_id, role, reason, status, created_at, updated_at = cancel
+        (
+            cancel_id,
+            role,
+            sender_id,
+            reason,
+            status,
+            contract_id,
+            created_at,
+            updated_at
+        ) = cancel
 
         current_mark = f"{cancel_id}:{status}"
         if last_cancel_mark is None:
             last_cancel_mark = current_mark
         elif current_mark != last_cancel_mark:
 
+            cur.execute("""
+                        SELECT c.cost,
+                               c."arrivalDate",
+                               c."departureDate",
+                               c."baseApartmentAdData",
+                               c."tenantId",
+                               c."landlordId",
+                               c."tenantInformation",
+                               c."landlordInformation",
+                               c."apartmentAdId"
+                        FROM contracts c
+                        WHERE c.id = %s
+                        """, (contract_id,))
+            contract_data = cur.fetchone()
+
+            if contract_data:
+                (
+                    c_cost,
+                    c_arrival,
+                    c_departure,
+                    c_ad,
+                    c_tenant_id,
+                    c_landlord_id,
+                    c_tenant_info,
+                    c_landlord_info,
+                    c_apartment_ad_id
+                ) = contract_data
+
+                ad_title = (c_ad or {}).get("title", "Квартира")
+                city = (c_ad or {}).get("address", {}).get("city", "")
+                price = format_price(c_cost)
+                link = get_apartment_link(c_apartment_ad_id)
+                link_line = f'\n🔗 <a href="{link}">Открыть объявление</a>' if link else ""
+
+                tenant = extract_person(c_tenant_info, fallback_user_id=c_tenant_id)
+                landlord = extract_person(c_landlord_info, fallback_user_id=c_landlord_id)
+
+                if role == "TENANT":
+                    requester = tenant
+                    requester_label = "Гость"
+                else:
+                    requester = landlord
+                    requester_label = "Собственник"
+
             if status == "PROCESSING":
                 send(f"""
 ⚠️ <b>Запрос на отмену</b>
 🕒 Создано: <b>{to_almaty(created_at)}</b>
 
-От: <b>{role}</b>
+Отправил: <b>{requester_label}</b>  
+👤 {requester['name']}  
+📞 {requester['phone']}
+
 Причина: {reason}
+
+🏠 <b>{ad_title}</b>
+🌆 {city}
+
+👤 Гость: {tenant['name']}  
+📞 {tenant['phone']}
+
+🏡 Собственник: {landlord['name']}  
+📞 {landlord['phone']}
+
+📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
+💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
             elif status == "APPROVED":
@@ -326,8 +394,23 @@ while True:
 🟢 <b>Отмена одобрена</b>
 🕒 Обновлено: <b>{to_almaty(updated_at)}</b>
 
-От: <b>{role}</b>
+Отправил: <b>{requester_label}</b>  
+👤 {requester['name']}  
+📞 {requester['phone']}
+
 Причина: {reason}
+
+🏠 <b>{ad_title}</b>
+🌆 {city}
+
+👤 Гость: {tenant['name']}  
+📞 {tenant['phone']}
+
+🏡 Собственник: {landlord['name']}  
+📞 {landlord['phone']}
+
+📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
+💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
             elif status == "DECLINED":
@@ -335,8 +418,23 @@ while True:
 🔴 <b>Отмена отклонена</b>
 🕒 Обновлено: <b>{to_almaty(updated_at)}</b>
 
-От: <b>{role}</b>
+Отправил: <b>{requester_label}</b>  
+👤 {requester['name']}  
+📞 {requester['phone']}
+
 Причина: {reason}
+
+🏠 <b>{ad_title}</b>
+🌆 {city}
+
+👤 Гость: {tenant['name']}  
+📞 {tenant['phone']}
+
+🏡 Собственник: {landlord['name']}  
+📞 {landlord['phone']}
+
+📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
+💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
             last_cancel_mark = current_mark
