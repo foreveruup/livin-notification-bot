@@ -3,7 +3,7 @@ import psycopg2
 import requests
 from dotenv import load_dotenv
 import os
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 
 load_dotenv()
 
@@ -17,10 +17,15 @@ DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# Токен бота, который отвечает за брони
+TOKEN = os.getenv("TELEGRAM_BOOKING_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 
-# поддержка нескольких chat_id
-CHAT_IDS_RAW = os.getenv("TELEGRAM_CHAT_IDS") or os.getenv("TELEGRAM_CHAT_ID") or ""
+CHAT_IDS_RAW = (
+    os.getenv("TELEGRAM_BOOKING_CHAT_IDS")
+    or os.getenv("TELEGRAM_CHAT_IDS")
+    or os.getenv("TELEGRAM_CHAT_ID")
+    or ""
+)
 CHAT_IDS = []
 for part in CHAT_IDS_RAW.replace(" ", "").split(","):
     if part:
@@ -30,7 +35,7 @@ for part in CHAT_IDS_RAW.replace(" ", "").split(","):
             pass
 
 if not CHAT_IDS:
-    raise RuntimeError("Не указаны TELEGRAM_CHAT_IDS или TELEGRAM_CHAT_ID в .env")
+    raise RuntimeError("Не указаны TELEGRAM_BOOKING_CHAT_IDS/TELEGRAM_CHAT_IDS/TELEGRAM_CHAT_ID в .env")
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 10))
 
@@ -68,10 +73,8 @@ DB_CONN = (
 conn = psycopg2.connect(DB_CONN)
 cur = conn.cursor()
 
-# будем отслеживать "id:status", чтобы ловить смену статуса
-last_request_mark = None
-last_cancel_mark = None
-last_contract_mark = None
+last_request_mark = None   # для contract_requests
+last_contract_mark = None  # для contracts
 
 
 # ===================================
@@ -83,14 +86,18 @@ def fmt_date(d):
         return "-"
     return d.strftime("%d.%m.%Y")
 
+
 def to_almaty(dt):
     if not dt:
         return "-"
+    # в БД времена в UTC → +5 часов до Алматы
     return (dt + timedelta(hours=5)).strftime("%d.%m.%Y %H:%M")
+
 
 def format_price(cost):
     # cost / 100 * 1.12
     return round(cost / 100 * 1.12)
+
 
 def get_user_info(user_id):
     if not user_id:
@@ -110,6 +117,7 @@ def get_user_info(user_id):
     except Exception as e:
         print("get_user_info error:", e)
         return {"name": "—", "phone": "—"}
+
 
 def extract_person(info_json, fallback_user_id=None):
     """
@@ -140,6 +148,7 @@ def extract_person(info_json, fallback_user_id=None):
 
     return {"name": name, "phone": phone}
 
+
 def get_apartment_link(apartment_id):
     if not apartment_id:
         return ""
@@ -161,7 +170,11 @@ def get_apartment_link(apartment_id):
         return ""
 
 
-print("Notifier started...")
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+print("Booking notifier started...")
 
 
 # ===================================
@@ -169,7 +182,6 @@ print("Notifier started...")
 # ===================================
 
 while True:
-
     # =====================================================
     # 1) contract_requests (заявки)
     # =====================================================
@@ -225,16 +237,15 @@ while True:
             link = get_apartment_link(apartment_ad_id)
             link_line = f'\n🔗 <a href="{link}">Открыть объявление</a>' if link else ""
 
-            # PENDING уже нет, работаем с CREATED / ACCEPTED / REJECTED
             if status == "CREATED":
                 send(f"""
 ✉️ <b>Заявка отправлена</b>
 🕒 Создано: <b>{to_almaty(created_at)}</b>
 
-👤 Гость: <b>{tenant['name']}</b>  
+👤 Гость: <b>{tenant['name']}</b>
 📞 {tenant['phone']}
 
-🏡 Собственник: <b>{landlord['name']}</b>  
+🏡 Собственник: <b>{landlord['name']}</b>
 📞 {landlord['phone']}
 
 🏠 Квартира: <b>{ad_title}</b>
@@ -250,10 +261,10 @@ while True:
 🕒 Создано: <b>{to_almaty(created_at)}</b>
 🕒 Обновлено: <b>{to_almaty(updated_at)}</b>
 
-👤 Гость: <b>{tenant['name']}</b>  
+👤 Гость: <b>{tenant['name']}</b>
 📞 {tenant['phone']}
 
-🏡 Собственник: <b>{landlord['name']}</b>  
+🏡 Собственник: <b>{landlord['name']}</b>
 📞 {landlord['phone']}
 
 🏠 Квартира: <b>{ad_title}</b>
@@ -269,10 +280,10 @@ while True:
 🕒 Создано: <b>{to_almaty(created_at)}</b>
 🕒 Обновлено: <b>{to_almaty(updated_at)}</b>
 
-👤 Гость: <b>{tenant['name']}</b>  
+👤 Гость: <b>{tenant['name']}</b>
 📞 {tenant['phone']}
 
-🏡 Собственник: <b>{landlord['name']}</b>  
+🏡 Собственник: <b>{landlord['name']}</b>
 📞 {landlord['phone']}
 
 🏠 Квартира: <b>{ad_title}</b>
@@ -284,164 +295,8 @@ while True:
 
             last_request_mark = current_mark
 
-
     # =====================================================
-    # 2) contract_cancel_requests (отмена)
-    # =====================================================
-
-    cur.execute("""
-                SELECT id,
-                       "senderRole",
-                       "senderId",
-                       "rejectReason",
-                       status,
-                       "contractId",
-                       "createdAt",
-                       "updatedAt"
-                FROM contract_cancel_requests
-                ORDER BY "updatedAt" DESC LIMIT 1;
-                """)
-
-    cancel = cur.fetchone()
-
-    if cancel:
-        (
-            cancel_id,
-            role,
-            sender_id,
-            reason,
-            status,
-            contract_id,
-            created_at,
-            updated_at
-        ) = cancel
-
-        current_mark = f"{cancel_id}:{status}"
-        if last_cancel_mark is None:
-            last_cancel_mark = current_mark
-        elif current_mark != last_cancel_mark:
-
-            cur.execute("""
-                        SELECT c.cost,
-                               c."arrivalDate",
-                               c."departureDate",
-                               c."baseApartmentAdData",
-                               c."tenantId",
-                               c."landlordId",
-                               c."tenantInformation",
-                               c."landlordInformation",
-                               c."apartmentAdId"
-                        FROM contracts c
-                        WHERE c.id = %s
-                        """, (contract_id,))
-            contract_data = cur.fetchone()
-
-            if contract_data:
-                (
-                    c_cost,
-                    c_arrival,
-                    c_departure,
-                    c_ad,
-                    c_tenant_id,
-                    c_landlord_id,
-                    c_tenant_info,
-                    c_landlord_info,
-                    c_apartment_ad_id
-                ) = contract_data
-
-                ad_title = (c_ad or {}).get("title", "Квартира")
-                city = (c_ad or {}).get("address", {}).get("city", "")
-                price = format_price(c_cost)
-                link = get_apartment_link(c_apartment_ad_id)
-                link_line = f'\n🔗 <a href="{link}">Открыть объявление</a>' if link else ""
-
-                tenant = extract_person(c_tenant_info, fallback_user_id=c_tenant_id)
-                landlord = extract_person(c_landlord_info, fallback_user_id=c_landlord_id)
-
-                if role == "TENANT":
-                    requester = tenant
-                    requester_label = "Гость"
-                else:
-                    requester = landlord
-                    requester_label = "Собственник"
-
-            if status == "PROCESSING":
-                send(f"""
-⚠️ <b>Запрос на отмену</b>
-🕒 Создано: <b>{to_almaty(created_at)}</b>
-
-Отправил: <b>{requester_label}</b>  
-👤 {requester['name']}  
-📞 {requester['phone']}
-
-Причина: {reason}
-
-🏠 <b>{ad_title}</b>
-🌆 {city}
-
-👤 Гость: {tenant['name']}  
-📞 {tenant['phone']}
-
-🏡 Собственник: {landlord['name']}  
-📞 {landlord['phone']}
-
-📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
-💰 Цена: <b>{price:,} ₸</b>{link_line}
-""")
-
-            elif status == "APPROVED":
-                send(f"""
-🟢 <b>Отмена одобрена</b>
-🕒 Обновлено: <b>{to_almaty(updated_at)}</b>
-
-Отправил: <b>{requester_label}</b>  
-👤 {requester['name']}  
-📞 {requester['phone']}
-
-Причина: {reason}
-
-🏠 <b>{ad_title}</b>
-🌆 {city}
-
-👤 Гость: {tenant['name']}  
-📞 {tenant['phone']}
-
-🏡 Собственник: {landlord['name']}  
-📞 {landlord['phone']}
-
-📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
-💰 Цена: <b>{price:,} ₸</b>{link_line}
-""")
-
-            elif status == "DECLINED":
-                send(f"""
-🔴 <b>Отмена отклонена</b>
-🕒 Обновлено: <b>{to_almaty(updated_at)}</b>
-
-Отправил: <b>{requester_label}</b>  
-👤 {requester['name']}  
-📞 {requester['phone']}
-
-Причина: {reason}
-
-🏠 <b>{ad_title}</b>
-🌆 {city}
-
-👤 Гость: {tenant['name']}  
-📞 {tenant['phone']}
-
-🏡 Собственник: {landlord['name']}  
-📞 {landlord['phone']}
-
-📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
-💰 Цена: <b>{price:,} ₸</b>{link_line}
-""")
-
-            last_cancel_mark = current_mark
-
-
-    # =====================================================
-    # 3) contracts (оплаченные / активные / завершённые)
+    # 2) contracts (оплаченные / активные / завершённые)
     # =====================================================
 
     cur.execute("""
@@ -458,7 +313,9 @@ while True:
             c."landlordInformation",
             c."apartmentAdId",
             c."createdAt",
-            c."updatedAt"
+            c."updatedAt",
+            c."isPaymentSuccess",
+            c."payedAt"
         FROM contracts c
         ORDER BY c."updatedAt" DESC
         LIMIT 1;
@@ -480,10 +337,27 @@ while True:
             c_landlord_info,
             c_apartment_ad_id,
             c_created,
-            c_updated
+            c_updated,
+            c_is_payment_success,
+            c_payed_at,
         ) = contract
 
-        current_mark = f"{c_id}:{c_status}"
+        # флаг: пора ли уже считать проживание завершённым по времени
+        completed_ready = int(
+            c_status == "COMPLETED"
+            and c_departure is not None
+            and now_utc() >= c_departure
+        )
+
+        # учитываем статус, факт оплаты и то, прошёл ли departureDate для COMPLETED
+        current_mark = (
+            f"{c_id}:"
+            f"{c_status}:"
+            f"{int(bool(c_is_payment_success))}:"
+            f"{int(bool(c_payed_at))}:"
+            f"{completed_ready}"
+        )
+
         if last_contract_mark is None:
             last_contract_mark = current_mark
         elif current_mark != last_contract_mark:
@@ -508,10 +382,10 @@ while True:
 📄 <b>Контракт создан</b>
 🕒 {to_almaty(c_created)}
 
-👤 Гость: <b>{tenant['name']}</b>  
+👤 Гость: <b>{tenant['name']}</b>
 📞 {tenant['phone']}
 
-🏡 Собственник: <b>{landlord['name']}</b>  
+🏡 Собственник: <b>{landlord['name']}</b>
 📞 {landlord['phone']}
 
 🏠 {title}
@@ -522,34 +396,40 @@ while True:
 """)
 
             elif c_status == "CONCLUDED":
-                send(f"""
+                # Сообщение только если реально оплата прошла
+                if c_is_payment_success and c_payed_at:
+                    send(f"""
 💳 <b>Бронь оплачена</b>
-🕒 {to_almaty(c_updated)}
+🕒 Создано: <b>{to_almaty(c_created)}</b>
+🕒 Оплачено: <b>{to_almaty(c_payed_at)}</b>
 
 🏠 {title}
 🌆 {city}
 
-👤 Гость: <b>{tenant['name']}</b>  
+👤 Гость: <b>{tenant['name']}</b>
 📞 {tenant['phone']}
 
-🏡 Собственник: <b>{landlord['name']}</b>  
+🏡 Собственник: <b>{landlord['name']}</b>
 📞 {landlord['phone']}
 
 💰 <b>{price:,} ₸</b>{link_line}
 """)
+                # если статус CONCLUDED, но оплаты ещё нет — просто ничего не шлём
 
             elif c_status == "COMPLETED":
-                send(f"""
+                # отправляем только когда по времени уже можно
+                if completed_ready:
+                    send(f"""
 🏁 <b>Проживание завершено</b>
 🕒 {to_almaty(c_updated)}
 
 🏠 {title}
 🌆 {city}
 
-👤 Гость: <b>{tenant['name']}</b>  
+👤 Гость: <b>{tenant['name']}</b>
 📞 {tenant['phone']}
 
-🏡 Собственник: <b>{landlord['name']}</b>  
+🏡 Собственник: <b>{landlord['name']}</b>
 📞 {landlord['phone']}{link_line}
 """)
 
@@ -561,10 +441,10 @@ while True:
 🏠 {title}
 🌆 {city}
 
-👤 Гость: <b>{tenant['name']}</b>  
+👤 Гость: <b>{tenant['name']}</b>
 📞 {tenant['phone']}
 
-🏡 Собственник: <b>{landlord['name']}</b>  
+🏡 Собственник: <b>{landlord['name']}</b>
 📞 {landlord['phone']}{link_line}
 """)
 
@@ -577,7 +457,7 @@ ID: {c_id}
 🏠 {title}{link_line}
 """)
 
+            # в конце обновляем маркер
             last_contract_mark = current_mark
-
 
     time.sleep(CHECK_INTERVAL)
