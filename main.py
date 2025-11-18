@@ -315,7 +315,8 @@ while True:
             c."createdAt",
             c."updatedAt",
             c."isPaymentSuccess",
-            c."payedAt"
+            c."payedAt",
+            c."retryPaymentAttempts"
         FROM contracts c
         ORDER BY c."updatedAt" DESC
         LIMIT 1;
@@ -340,7 +341,10 @@ while True:
             c_updated,
             c_is_payment_success,
             c_payed_at,
+            c_retry_payment_attempts,
         ) = contract
+
+        c_retry_payment_attempts = c_retry_payment_attempts or 0
 
         # флаг: пора ли уже считать проживание завершённым по времени
         completed_ready = int(
@@ -349,12 +353,13 @@ while True:
             and now_utc() >= c_departure
         )
 
-        # учитываем статус, факт оплаты и то, прошёл ли departureDate для COMPLETED
+        # учитываем статус, факт оплаты, количество попыток и то, прошёл ли departureDate
         current_mark = (
             f"{c_id}:"
             f"{c_status}:"
             f"{int(bool(c_is_payment_success))}:"
             f"{int(bool(c_payed_at))}:"
+            f"{int(c_retry_payment_attempts)}:"
             f"{completed_ready}"
         )
 
@@ -412,6 +417,7 @@ while True:
 🏡 Собственник: <b>{landlord['name']}</b>
 📞 {landlord['phone']}
 
+📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
 💰 <b>{price:,} ₸</b>{link_line}
 """)
                 # если статус CONCLUDED, но оплаты ещё нет — просто ничего не шлём
@@ -434,7 +440,27 @@ while True:
 """)
 
             elif c_status == "REJECTED":
-                send(f"""
+                # кейс: оплата так и не прошла после попыток
+                if (not c_is_payment_success) and c_retry_payment_attempts >= 1:
+                    send(f"""
+💥 <b>Оплата не прошла</b>
+Попыток оплаты: <b>{c_retry_payment_attempts}</b>
+
+🏠 {title}
+🌆 {city}
+
+👤 Гость: <b>{tenant['name']}</b>
+📞 {tenant['phone']}
+
+🏡 Собственник: <b>{landlord['name']}</b>
+📞 {landlord['phone']}
+
+📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
+💰 {price:,} ₸{link_line}
+""")
+                else:
+                    # обычный кейс отмены контракта
+                    send(f"""
 ❌ <b>Контракт отменён</b>
 🕒 {to_almaty(c_updated)}
 
@@ -445,7 +471,10 @@ while True:
 📞 {tenant['phone']}
 
 🏡 Собственник: <b>{landlord['name']}</b>
-📞 {landlord['phone']}{link_line}
+📞 {landlord['phone']}
+
+📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
+💰 {price:,} ₸{link_line}
 """)
 
             elif c_status == "FREEZE":
