@@ -3,7 +3,7 @@ import psycopg2
 import requests
 from dotenv import load_dotenv
 import os
-from datetime import timedelta, datetime, timezone
+from datetime import timedelta, datetime, timezone, time as dtime
 
 load_dotenv()
 
@@ -75,6 +75,9 @@ cur = conn.cursor()
 
 last_request_mark = None   # для contract_requests
 last_contract_mark = None  # для contracts
+
+# для ежедневной сводки
+last_summary_date = None   # дата (в Алматы) за которую уже отправляли отчёт
 
 
 # ===================================
@@ -172,6 +175,11 @@ def get_apartment_link(apartment_id):
 
 def now_utc():
     return datetime.now(timezone.utc)
+
+
+def now_almaty():
+    # Алматы = UTC+5
+    return now_utc() + timedelta(hours=5)
 
 
 print("Booking notifier started...")
@@ -406,7 +414,7 @@ while True:
                     send(f"""
 💳 <b>Бронь оплачена</b>
 🕒 Создано: <b>{to_almaty(c_created)}</b>
-🕒 Оплачено: <b>{to_almaty(c_payed_at)}</b>
+🕒 Оплачено: <b>{to_almaty(c_payedAt)}</b>
 
 🏠 {title}
 🌆 {city}
@@ -507,5 +515,48 @@ ID: {c_id}
 
             # в конце обновляем маркер
             last_contract_mark = current_mark
+
+    # =====================================================
+    # 3) ЕЖЕДНЕВНАЯ СВОДКА ПО БРОНИРОВАНИЯМ
+    # =====================================================
+
+    try:
+        alm_now = now_almaty()
+        # хотим отправлять в 09:00 по Алматы
+        if alm_now.time() >= dtime(9, 0):
+            # дата, за которую считаем статистику — вчера в Алматы
+            target_date = (alm_now.date() - timedelta(days=1))
+
+            # отправляем один раз за target_date
+            if last_summary_date != target_date:
+                # считаем границы вчерашнего дня по времени Алматы
+                # [00:00; 24:00) Алматы -> переводим в UTC
+                start_almaty = datetime.combine(target_date, dtime(0, 0))
+                start_utc = start_almaty - timedelta(hours=5)
+                end_utc = start_utc + timedelta(days=1)
+
+                # количество успешных бронирований за день
+                cur.execute("""
+                    SELECT COUNT(*)
+                    FROM contracts
+                    WHERE status = 'CONCLUDED'
+                      AND "isPaymentSuccess" = TRUE
+                      AND "payedAt" >= %s
+                      AND "payedAt" < %s;
+                """, (start_utc, end_utc))
+                row = cur.fetchone()
+                success_count = row[0] if row else 0
+
+                # можно в будущем добавить сумму, но пока только количество
+                send(f"""
+📊 <b>Итоги за {target_date.strftime('%d.%m.%Y')} (Алматы)</b>
+
+Успешных бронирований: <b>{success_count}</b>
+(оплата прошла, контракт в статусе CONCLUDED)
+""")
+
+                last_summary_date = target_date
+    except Exception as e:
+        print("Daily summary error:", e)
 
     time.sleep(CHECK_INTERVAL)
