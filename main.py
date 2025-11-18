@@ -4,6 +4,8 @@ import requests
 from dotenv import load_dotenv
 import os
 from datetime import timedelta, datetime, timezone, time as dtime
+import threading
+import pytz
 
 load_dotenv()
 
@@ -176,10 +178,127 @@ def get_apartment_link(apartment_id):
 def now_utc():
     return datetime.now(timezone.utc)
 
+ALMATY_TZ = pytz.timezone("Asia/Almaty")
+
+def to_almaty_dt(dt):
+    if not dt:
+        return None
+    return dt.astimezone(ALMATY_TZ)
+
+def today_almaty():
+    return datetime.now(ALMATY_TZ).date()
+
+def yesterday_almaty():
+    return today_almaty() - timedelta(days=1)
+
+def daily_report():
+    try:
+        today = today_almaty()
+        yesterday = yesterday_almaty()
+
+        # ---------- 1) БРОНИРОВАНИЯ ЗА ВЧЕРА ----------
+        cur.execute("""
+            SELECT id, cost, "arrivalDate", "departureDate", "baseApartmentAdData",
+                   "tenantInformation", "landlordInformation", "apartmentAdId", "payedAt"
+            FROM contracts
+            WHERE status = 'CONCLUDED'
+              AND "isPaymentSuccess" = true
+              AND "payedAt" IS NOT NULL
+        """)
+        rows = cur.fetchall()
+
+        bookings_yesterday = []
+        for row in rows:
+            (_, cost, arr, dep, ad, tenant_info, landlord_info, ap_id, payed_at) = row
+            if to_almaty_dt(payed_at).date() == yesterday:
+                bookings_yesterday.append(row)
+
+        # ---------- 2) ЗАЕЗДЫ СЕГОДНЯ ----------
+        cur.execute("""
+            SELECT id, cost, "arrivalDate", "departureDate", "baseApartmentAdData",
+                   "tenantInformation", "landlordInformation", "apartmentAdId"
+            FROM contracts
+            WHERE status = 'CONCLUDED'
+              AND "isPaymentSuccess" = true
+        """)
+        rows2 = cur.fetchall()
+
+        arrivals_today = []
+        for row in rows2:
+            (_, cost, arr, dep, ad, tenant_info, landlord_info, ap_id) = row
+            if arr and to_almaty_dt(arr).date() == today:
+                arrivals_today.append(row)
+
+        # ---------- 3) ВЫПЛАТЫ СЕГОДНЯ ----------
+        payouts_today = []
+        total_payout = 0
+
+        for row in rows2:
+            (cid, cost, arr, dep, ad, tenant_info, landlord_info, ap_id) = row
+            if arr and to_almaty_dt(arr).date() + timedelta(days=1) == today:
+                payout_sum = round(format_price(cost) * 0.97)  # минус 3%
+                payouts_today.append((row, payout_sum))
+                total_payout += payout_sum
+
+        # ---------- ФОРМИРОВАНИЕ СООБЩЕНИЯ ----------
+
+        msg = f"📊 <b>Ежедневная сводка за {yesterday.strftime('%d.%m.%Y')}</b>\n\n"
+
+        msg += f"📌 <b>Бронирований за вчера:</b> {len(bookings_yesterday)}\n\n"
+
+        msg += "🏨 <b>Предстоящие заезды сегодня:</b>\n"
+        if arrivals_today:
+            for idx, row in enumerate(arrivals_today, 1):
+                (_, cost, arr, dep, ad, tenant_info, landlord_info, ap_id) = row
+                ad_title = (ad or {}).get("title", "Квартира")
+                city = (ad or {}).get("address", {}).get("city", "")
+                msg += (
+                    f"{idx}) {ad_title} — {city}\n"
+                    f"   Заезд: {fmt_date(arr)}\n"
+                    f"   Выезд: {fmt_date(dep)}\n\n"
+                )
+        else:
+            msg += "— нет заездов сегодня\n\n"
+
+        msg += "💵 <b>Выплаты сегодня:</b>\n"
+        if payouts_today:
+            for idx, (row, payout_sum) in enumerate(payouts_today, 1):
+                (_, cost, arr, dep, ad, tenant_info, landlord_info, ap_id) = row
+                ad_title = (ad or {}).get("title", "Квартира")
+                city = (ad or {}).get("address", {}).get("city", "")
+                msg += (
+                    f"{idx}) {ad_title} — {city}\n"
+                    f"   Сумма: <b>{payout_sum:,} ₸</b>\n"
+                )
+            msg += f"\n💰 <b>Итого выплат:</b> {total_payout:,} ₸\n"
+        else:
+            msg += "— сегодня выплат нет\n"
+
+        send(msg)
+
+    except Exception as e:
+        print("Daily report error:", e)
+
 
 def now_almaty():
     # Алматы = UTC+5
     return now_utc() + timedelta(hours=5)
+
+def schedule_daily_report():
+    while True:
+        now = datetime.now(ALMATY_TZ)
+        target = now.replace(hour=9, minute=0, second=0, microsecond=0)
+
+        if now > target:
+            target += timedelta(days=1)
+
+        sleep_sec = (target - now).total_seconds()
+        time.sleep(sleep_sec)
+
+        daily_report()
+
+# Запускаем отдельным фоном
+threading.Thread(target=schedule_daily_report, daemon=True).start()
 
 
 print("Booking notifier started...")
@@ -404,8 +523,8 @@ while True:
 🏠 {title}
 🌆 {city}
 
-📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
-💰 {price:,} ₸{link_line}
+📅 {fmt_date(arrival)} → {fmt_date(departure)}
+💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
             elif c_status == "CONCLUDED":
@@ -414,7 +533,7 @@ while True:
                     send(f"""
 💳 <b>Бронь оплачена</b>
 🕒 Создано: <b>{to_almaty(c_created)}</b>
-🕒 Оплачено: <b>{to_almaty(c_payedAt)}</b>
+🕒 Оплачено: <b>{to_almaty(c_payed_at)}</b>
 
 🏠 {title}
 🌆 {city}
@@ -425,8 +544,8 @@ while True:
 🏡 Собственник: <b>{landlord['name']}</b>
 📞 {landlord['phone']}
 
-📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
-💰 <b>{price:,} ₸</b>{link_line}
+📅 {fmt_date(arrival)} → {fmt_date(departure)}
+💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
                 elif (not c_is_payment_success) and c_retry_payment_attempts == 0:
@@ -444,8 +563,8 @@ while True:
 🏡 Собственник: <b>{landlord['name']}</b>
 📞 {landlord['phone']}
 
-📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
-💰 {price:,} ₸{link_line}
+📅 {fmt_date(arrival)} → {fmt_date(departure)}
+💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
                 elif (not c_is_payment_success) and c_retry_payment_attempts >= 1:
@@ -463,8 +582,8 @@ while True:
 🏡 Собственник: <b>{landlord['name']}</b>
 📞 {landlord['phone']}
 
-📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
-💰 {price:,} ₸{link_line}
+📅 {fmt_date(arrival)} → {fmt_date(departure)}
+💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
                 # если статус CONCLUDED, но ни успеха, ни ошибки — ничего не шлём
 
@@ -483,6 +602,9 @@ while True:
 
 🏡 Собственник: <b>{landlord['name']}</b>
 📞 {landlord['phone']}{link_line}
+
+📅 {fmt_date(arrival)} → {fmt_date(departure)}
+💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
             elif c_status == "REJECTED":
@@ -500,8 +622,8 @@ while True:
 🏡 Собственник: <b>{landlord['name']}</b>
 📞 {landlord['phone']}
 
-📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
-💰 {price:,} ₸{link_line}
+📅 {fmt_date(arrival)} → {fmt_date(departure)}
+💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
             elif c_status == "FREEZE":
@@ -510,53 +632,20 @@ while True:
 🕒 {to_almaty(c_updated)}
 
 ID: {c_id}
+
 🏠 {title}{link_line}
+🌆 {city}
+
+👤 Гость: <b>{tenant['name']}</b>
+📞 {tenant['phone']}
+
+🏡 Собственник: <b>{landlord['name']}</b>
+📞 {landlord['phone']}
+
+📅 {fmt_date(arrival)} → {fmt_date(departure)}
+💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
             # в конце обновляем маркер
             last_contract_mark = current_mark
-
-    # =====================================================
-    # 3) ЕЖЕДНЕВНАЯ СВОДКА ПО БРОНИРОВАНИЯМ
-    # =====================================================
-
-    try:
-        alm_now = now_almaty()
-        # хотим отправлять в 09:00 по Алматы
-        if alm_now.time() >= dtime(9, 0):
-            # дата, за которую считаем статистику — вчера в Алматы
-            target_date = (alm_now.date() - timedelta(days=1))
-
-            # отправляем один раз за target_date
-            if last_summary_date != target_date:
-                # считаем границы вчерашнего дня по времени Алматы
-                # [00:00; 24:00) Алматы -> переводим в UTC
-                start_almaty = datetime.combine(target_date, dtime(0, 0))
-                start_utc = start_almaty - timedelta(hours=5)
-                end_utc = start_utc + timedelta(days=1)
-
-                # количество успешных бронирований за день
-                cur.execute("""
-                    SELECT COUNT(*)
-                    FROM contracts
-                    WHERE status = 'CONCLUDED'
-                      AND "isPaymentSuccess" = TRUE
-                      AND "payedAt" >= %s
-                      AND "payedAt" < %s;
-                """, (start_utc, end_utc))
-                row = cur.fetchone()
-                success_count = row[0] if row else 0
-
-                # можно в будущем добавить сумму, но пока только количество
-                send(f"""
-📊 <b>Итоги за {target_date.strftime('%d.%m.%Y')} (Алматы)</b>
-
-Успешных бронирований: <b>{success_count}</b>
-(оплата прошла, контракт в статусе CONCLUDED)
-""")
-
-                last_summary_date = target_date
-    except Exception as e:
-        print("Daily summary error:", e)
-
     time.sleep(CHECK_INTERVAL)
