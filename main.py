@@ -401,8 +401,8 @@ while True:
 """)
 
             elif c_status == "CONCLUDED":
-                # Сообщение только если реально оплата прошла
                 if c_is_payment_success and c_payed_at:
+                    # успешная оплата
                     send(f"""
 💳 <b>Бронь оплачена</b>
 🕒 Создано: <b>{to_almaty(c_created)}</b>
@@ -420,7 +420,45 @@ while True:
 📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
 💰 <b>{price:,} ₸</b>{link_line}
 """)
-                # если статус CONCLUDED, но оплаты ещё нет — просто ничего не шлём
+
+                elif (not c_is_payment_success) and c_retry_payment_attempts == 0:
+                    # первая автопопытка списания сразу после принятия не удалась
+                    send(f"""
+💥 <b>Оплата не прошла</b>
+Первая попытка списания после принятия заявки закончилась неуспешно.
+
+🏠 {title}
+🌆 {city}
+
+👤 Гость: <b>{tenant['name']}</b>
+📞 {tenant['phone']}
+
+🏡 Собственник: <b>{landlord['name']}</b>
+📞 {landlord['phone']}
+
+📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
+💰 {price:,} ₸{link_line}
+""")
+
+                elif (not c_is_payment_success) and c_retry_payment_attempts >= 1:
+                    # повторные попытки оплаты тоже не удались
+                    send(f"""
+💥 <b>Повторная оплата не прошла</b>
+Попыток оплаты: <b>{c_retry_payment_attempts}</b>
+
+🏠 {title}
+🌆 {city}
+
+👤 Гость: <b>{tenant['name']}</b>
+📞 {tenant['phone']}
+
+🏡 Собственник: <b>{landlord['name']}</b>
+📞 {landlord['phone']}
+
+📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
+💰 {price:,} ₸{link_line}
+""")
+                # если статус CONCLUDED, но ни успеха, ни ошибки — ничего не шлём
 
             elif c_status == "COMPLETED":
                 # отправляем только когда по времени уже можно
@@ -440,27 +478,8 @@ while True:
 """)
 
             elif c_status == "REJECTED":
-                # кейс: оплата так и не прошла после попыток
-                if (not c_is_payment_success) and c_retry_payment_attempts >= 1:
-                    send(f"""
-💥 <b>Оплата не прошла</b>
-Попыток оплаты: <b>{c_retry_payment_attempts}</b>
-
-🏠 {title}
-🌆 {city}
-
-👤 Гость: <b>{tenant['name']}</b>
-📞 {tenant['phone']}
-
-🏡 Собственник: <b>{landlord['name']}</b>
-📞 {landlord['phone']}
-
-📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
-💰 {price:,} ₸{link_line}
-""")
-                else:
-                    # обычный кейс отмены контракта
-                    send(f"""
+                # финальный кейс: контракт не состоится
+                send(f"""
 ❌ <b>Контракт отменён</b>
 🕒 {to_almaty(c_updated)}
 
