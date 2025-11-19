@@ -178,18 +178,23 @@ def get_apartment_link(apartment_id):
 def now_utc():
     return datetime.now(timezone.utc)
 
+
 ALMATY_TZ = pytz.timezone("Asia/Almaty")
+
 
 def to_almaty_dt(dt):
     if not dt:
         return None
     return dt.astimezone(ALMATY_TZ)
 
+
 def today_almaty():
     return datetime.now(ALMATY_TZ).date()
 
+
 def yesterday_almaty():
     return today_almaty() - timedelta(days=1)
+
 
 def daily_report():
     try:
@@ -249,13 +254,23 @@ def daily_report():
         msg += "🏨 <b>Предстоящие заезды сегодня:</b>\n"
         if arrivals_today:
             for idx, row in enumerate(arrivals_today, 1):
-                (_, cost, arr, dep, ad, tenant_info, landlord_info, ap_id) = row
+                # 🔹 детальная информация по заездам
+                (cid, cost, arr, dep, ad, tenant_info, landlord_info, ap_id) = row
                 ad_title = (ad or {}).get("title", "Квартира")
                 city = (ad or {}).get("address", {}).get("city", "")
+
+                tenant = extract_person(tenant_info)
+                landlord = extract_person(landlord_info)
+                price = format_price(cost)
+                link = get_apartment_link(ap_id)
+                link_line = f'\n      🔗 <a href="{link}">Открыть объявление</a>' if link else ""
+
                 msg += (
-                    f"{idx}) {ad_title} — {city}\n"
-                    f"   Заезд: {fmt_date(arr)}\n"
-                    f"   Выезд: {fmt_date(dep)}\n\n"
+                    f"{idx}) <b>{ad_title}</b> — {city}\n"
+                    f"   👤 Гость: <b>{tenant['name']}</b>  | 📞 {tenant['phone']}\n"
+                    f"   🏡 Собственник: <b>{landlord['name']}</b>  | 📞 {landlord['phone']}\n"
+                    f"   📅 Даты: {fmt_date(arr)} → {fmt_date(dep)}\n"
+                    f"   💰 Цена: <b>{price:,} ₸</b>{link_line}\n\n"
                 )
         else:
             msg += "— нет заездов сегодня\n\n"
@@ -284,6 +299,7 @@ def now_almaty():
     # Алматы = UTC+5
     return now_utc() + timedelta(hours=5)
 
+
 def schedule_daily_report():
     while True:
         now = datetime.now(ALMATY_TZ)
@@ -297,9 +313,9 @@ def schedule_daily_report():
 
         daily_report()
 
+
 # Запускаем отдельным фоном
 threading.Thread(target=schedule_daily_report, daemon=True).start()
-
 
 print("Booking notifier started...")
 
@@ -523,7 +539,7 @@ while True:
 🏠 {title}
 🌆 {city}
 
-📅 {fmt_date(arrival)} → {fmt_date(departure)}
+📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
 💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
@@ -544,7 +560,7 @@ while True:
 🏡 Собственник: <b>{landlord['name']}</b>
 📞 {landlord['phone']}
 
-📅 {fmt_date(arrival)} → {fmt_date(departure)}
+📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
 💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
@@ -563,7 +579,7 @@ while True:
 🏡 Собственник: <b>{landlord['name']}</b>
 📞 {landlord['phone']}
 
-📅 {fmt_date(arrival)} → {fmt_date(departure)}
+📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
 💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
@@ -582,7 +598,7 @@ while True:
 🏡 Собственник: <b>{landlord['name']}</b>
 📞 {landlord['phone']}
 
-📅 {fmt_date(arrival)} → {fmt_date(departure)}
+📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
 💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
                 # если статус CONCLUDED, но ни успеха, ни ошибки — ничего не шлём
@@ -603,7 +619,7 @@ while True:
 🏡 Собственник: <b>{landlord['name']}</b>
 📞 {landlord['phone']}{link_line}
 
-📅 {fmt_date(arrival)} → {fmt_date(departure)}
+📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
 💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
@@ -622,7 +638,7 @@ while True:
 🏡 Собственник: <b>{landlord['name']}</b>
 📞 {landlord['phone']}
 
-📅 {fmt_date(arrival)} → {fmt_date(departure)}
+📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
 💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
@@ -642,10 +658,11 @@ ID: {c_id}
 🏡 Собственник: <b>{landlord['name']}</b>
 📞 {landlord['phone']}
 
-📅 {fmt_date(arrival)} → {fmt_date(departure)}
+📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
 💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
             # в конце обновляем маркер
             last_contract_mark = current_mark
+
     time.sleep(CHECK_INTERVAL)
