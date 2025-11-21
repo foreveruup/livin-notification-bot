@@ -241,7 +241,9 @@ def daily_report():
         for row in rows2:
             (cid, cost, arr, dep, ad, tenant_info, landlord_info, ap_id) = row
             if arr and to_almaty_dt(arr).date() + timedelta(days=1) == today:
-                payout_sum = round(format_price(cost) * 0.97)  # минус 3%
+                # сумма контракта в тенге (без 1.12)
+                contract_sum = round(cost / 100)          # <<< сумма контракта
+                payout_sum = round(contract_sum * 0.97)   # <<< минус 3% для владельца
                 payouts_today.append((row, payout_sum))
                 total_payout += payout_sum
 
@@ -254,14 +256,13 @@ def daily_report():
         msg += "🏨 <b>Предстоящие заезды сегодня:</b>\n"
         if arrivals_today:
             for idx, row in enumerate(arrivals_today, 1):
-                # 🔹 детальная информация по заездам
                 (cid, cost, arr, dep, ad, tenant_info, landlord_info, ap_id) = row
                 ad_title = (ad or {}).get("title", "Квартира")
                 city = (ad or {}).get("address", {}).get("city", "")
 
                 tenant = extract_person(tenant_info)
                 landlord = extract_person(landlord_info)
-                price = format_price(cost)
+                price = format_price(cost)  # тут гостевая цена, как и раньше
                 link = get_apartment_link(ap_id)
                 link_line = f'\n      🔗 <a href="{link}">Открыть объявление</a>' if link else ""
 
@@ -281,8 +282,12 @@ def daily_report():
                 (_, cost, arr, dep, ad, tenant_info, landlord_info, ap_id) = row
                 ad_title = (ad or {}).get("title", "Квартира")
                 city = (ad or {}).get("address", {}).get("city", "")
+
+                landlord = extract_person(landlord_info)  # <<< добавили владельца
+
                 msg += (
-                    f"{idx}) {ad_title} — {city}\n"
+                    f"{idx}) <b>{ad_title}</b> — {city}\n"
+                    f"   🏡 Собственник: <b>{landlord['name']}</b>  | 📞 {landlord['phone']}\n"
                     f"   Сумма: <b>{payout_sum:,} ₸</b>\n"
                 )
             msg += f"\n💰 <b>Итого выплат:</b> {total_payout:,} ₸\n"
