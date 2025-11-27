@@ -508,8 +508,10 @@ while True:
             f"{int(bool(c_is_payment_success))}:"
             f"{int(bool(c_payed_at))}:"
             f"{int(c_retry_payment_attempts)}:"
-            f"{completed_ready}"
         )
+
+        if c_status == "COMPLETED":
+            current_mark += f"{int(completed_ready)}"
 
         if last_contract_mark is None:
             last_contract_mark = current_mark
