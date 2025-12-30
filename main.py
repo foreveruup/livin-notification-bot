@@ -1,11 +1,14 @@
 import time
+import os
+import threading
+from datetime import timedelta, datetime, timezone
+from typing import List, Callable, Any, Optional
+
 import psycopg2
 import requests
 from dotenv import load_dotenv
-import os
-from datetime import timedelta, datetime, timezone, time as dtime
-import threading
 import pytz
+
 
 load_dotenv()
 
@@ -28,7 +31,8 @@ CHAT_IDS_RAW = (
     or os.getenv("TELEGRAM_CHAT_ID")
     or ""
 )
-CHAT_IDS = []
+
+CHAT_IDS: List[int] = []
 for part in CHAT_IDS_RAW.replace(" ", "").split(","):
     if part:
         try:
@@ -41,27 +45,54 @@ if not CHAT_IDS:
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 10))
 
+ALMATY_TZ = pytz.timezone("Asia/Almaty")
 
 # ===================================
 # Telegram
 # ===================================
 
+TG_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+
+
 def send(text: str):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    """
+    Telegram send with retries + timeouts.
+    Never raises (to avoid crashing the process).
+    """
+    text = (text or "").strip()
+    if not text:
+        return
+
     for chat_id in CHAT_IDS:
-        try:
-            requests.post(url, json={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            })
-        except Exception as e:
-            print(f"Telegram error for chat {chat_id}:", e)
+        ok = False
+        for attempt in range(3):
+            try:
+                r = requests.post(
+                    TG_URL,
+                    json={
+                        "chat_id": chat_id,
+                        "text": text,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=10,
+                )
+                if r.status_code == 200:
+                    ok = True
+                    break
+                else:
+                    print(f"Telegram status {r.status_code}: {r.text[:200]}")
+            except Exception as e:
+                print(f"Telegram error for chat {chat_id} (attempt {attempt+1}):", e)
+
+            time.sleep(1 + attempt)
+
+        if not ok:
+            print(f"Telegram send failed for chat {chat_id} after retries")
 
 
 # ===================================
-# DB Connection
+# DB Connection helper (reconnect + retry)
 # ===================================
 
 DB_CONN = (
@@ -69,22 +100,63 @@ DB_CONN = (
     f"port={DB_PORT} "
     f"dbname={DB_NAME} "
     f"user={DB_USER} "
-    f"password={DB_PASSWORD}"
+    f"password={DB_PASSWORD} "
+    # keepalive helps with idle SSL drops; connect_timeout avoids hanging
+    f"connect_timeout=10 "
+    f"keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=5"
 )
 
-conn = psycopg2.connect(DB_CONN)
-cur = conn.cursor()
 
-last_request_mark = None   # для contract_requests
-last_contract_mark = None  # для contracts
+def with_db(fn: Callable[[Any], Any], *, retries: int = 5):
+    """
+    Runs fn(cur) with a fresh DB connection.
+    Retries on OperationalError with exponential backoff.
+    Closes connection every time to avoid stale SSL sessions.
+    """
+    backoff = 1
+    last_err: Optional[Exception] = None
 
-# для ежедневной сводки
-last_summary_date = None   # дата (в Алматы) за которую уже отправляли отчёт
+    for attempt in range(retries):
+        conn = None
+        try:
+            conn = psycopg2.connect(DB_CONN)
+            conn.autocommit = True
+            cur = conn.cursor()
+            return fn(cur)
+        except psycopg2.OperationalError as e:
+            last_err = e
+            print(f"DB OperationalError (attempt {attempt+1}/{retries}): {e}")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 15)
+        except Exception as e:
+            # other DB errors: don't crash, retry a bit
+            last_err = e
+            print(f"DB error (attempt {attempt+1}/{retries}): {e}")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 15)
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+
+    raise last_err if last_err else RuntimeError("DB error: unknown")
 
 
 # ===================================
 # Helpers
 # ===================================
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def to_almaty(dt):
+    if not dt:
+        return "-"
+    return dt.astimezone(ALMATY_TZ).strftime("%d.%m.%Y %H:%M")
+
 
 def fmt_date(d):
     if not d:
@@ -92,27 +164,31 @@ def fmt_date(d):
     return d.strftime("%d.%m.%Y")
 
 
-def to_almaty(dt):
-    if not dt:
-        return "-"
-    # в БД времена в UTC → +5 часов до Алматы
-    return (dt + timedelta(hours=5)).strftime("%d.%m.%Y %H:%M")
-
-
 def format_price(cost):
     # cost / 100 * 1.12
     return round(cost / 100 * 1.12)
 
 
-def get_user_info(user_id):
+def today_almaty():
+    return datetime.now(ALMATY_TZ).date()
+
+
+def yesterday_almaty():
+    return today_almaty() - timedelta(days=1)
+
+
+def get_user_info(cur, user_id):
     if not user_id:
         return {"name": "—", "phone": "—"}
     try:
-        cur.execute("""
-            SELECT "firstName", "lastName", phone 
-            FROM users 
+        cur.execute(
+            """
+            SELECT "firstName", "lastName", phone
+            FROM users
             WHERE id = %s LIMIT 1;
-        """, (user_id,))
+            """,
+            (user_id,),
+        )
         row = cur.fetchone()
         if not row:
             return {"name": "—", "phone": "—"}
@@ -124,9 +200,9 @@ def get_user_info(user_id):
         return {"name": "—", "phone": "—"}
 
 
-def extract_person(info_json, fallback_user_id=None):
+def extract_person(info_json, cur=None, fallback_user_id=None):
     """
-    info_json: {"firstName","lastName","phoneNumber", ...}
+    info_json: {"firstName","lastName","phoneNumber"/"phone", ...}
     """
     name = "—"
     phone = "—"
@@ -137,15 +213,11 @@ def extract_person(info_json, fallback_user_id=None):
         full = f"{first} {last}".strip()
         if full:
             name = full
-        phone = (
-            info_json.get("phoneNumber")
-            or info_json.get("phone")
-            or "—"
-        )
+        phone = info_json.get("phoneNumber") or info_json.get("phone") or "—"
 
-    # если из JSON чего-то не хватает — добиваем из users
-    if fallback_user_id and (name == "—" or phone == "—"):
-        u = get_user_info(fallback_user_id)
+    # if json is incomplete — try users table
+    if cur is not None and fallback_user_id and (name == "—" or phone == "—"):
+        u = get_user_info(cur, fallback_user_id)
         if name == "—":
             name = u["name"]
         if phone == "—":
@@ -154,17 +226,20 @@ def extract_person(info_json, fallback_user_id=None):
     return {"name": name, "phone": phone}
 
 
-def get_apartment_link(apartment_id):
+def get_apartment_link(cur, apartment_id):
     if not apartment_id:
         return ""
     try:
-        cur.execute("""
+        cur.execute(
+            """
             SELECT slug
             FROM apartment_identificator
             WHERE "apartmentId" = %s
             ORDER BY "createdAt" DESC
             LIMIT 1;
-        """, (apartment_id,))
+            """,
+            (apartment_id,),
+        )
         row = cur.fetchone()
         if not row or not row[0]:
             return ""
@@ -175,82 +250,65 @@ def get_apartment_link(apartment_id):
         return ""
 
 
-def now_utc():
-    return datetime.now(timezone.utc)
-
-
-ALMATY_TZ = pytz.timezone("Asia/Almaty")
-
-
-def to_almaty_dt(dt):
-    if not dt:
-        return None
-    return dt.astimezone(ALMATY_TZ)
-
-
-def today_almaty():
-    return datetime.now(ALMATY_TZ).date()
-
-
-def yesterday_almaty():
-    return today_almaty() - timedelta(days=1)
-
+# ===================================
+# Daily report
+# ===================================
 
 def daily_report():
-    try:
+    def _run(cur):
         today = today_almaty()
         yesterday = yesterday_almaty()
 
         # ---------- 1) БРОНИРОВАНИЯ ЗА ВЧЕРА ----------
-        cur.execute("""
+        cur.execute(
+            """
             SELECT id, cost, "arrivalDate", "departureDate", "baseApartmentAdData",
                    "tenantInformation", "landlordInformation", "apartmentAdId", "payedAt"
             FROM contracts
             WHERE status = 'CONCLUDED'
               AND "isPaymentSuccess" = true
               AND "payedAt" IS NOT NULL
-        """)
+            """
+        )
         rows = cur.fetchall()
 
         bookings_yesterday = []
         for row in rows:
-            (_, cost, arr, dep, ad, tenant_info, landlord_info, ap_id, payed_at) = row
-            if to_almaty_dt(payed_at).date() == yesterday:
+            payed_at = row[8]
+            if payed_at and payed_at.astimezone(ALMATY_TZ).date() == yesterday:
                 bookings_yesterday.append(row)
 
         # ---------- 2) ЗАЕЗДЫ СЕГОДНЯ ----------
-        cur.execute("""
+        cur.execute(
+            """
             SELECT id, cost, "arrivalDate", "departureDate", "baseApartmentAdData",
                    "tenantInformation", "landlordInformation", "apartmentAdId"
             FROM contracts
             WHERE status = 'CONCLUDED'
               AND "isPaymentSuccess" = true
-        """)
+            """
+        )
         rows2 = cur.fetchall()
 
         arrivals_today = []
-        for row in rows2:
-            (_, cost, arr, dep, ad, tenant_info, landlord_info, ap_id) = row
-            if arr and to_almaty_dt(arr).date() == today:
-                arrivals_today.append(row)
-
-        # ---------- 3) ВЫПЛАТЫ СЕГОДНЯ ----------
         payouts_today = []
         total_payout = 0
 
         for row in rows2:
             (cid, cost, arr, dep, ad, tenant_info, landlord_info, ap_id) = row
-            if arr and to_almaty_dt(arr).date() + timedelta(days=1) == today:
-                # сумма контракта в тенге (без 1.12)
-                contract_sum = round(cost / 100)          # <<< сумма контракта
-                payout_sum = round(contract_sum * 0.97)   # <<< минус 3% для владельца
+
+            if arr and arr.astimezone(ALMATY_TZ).date() == today:
+                arrivals_today.append(row)
+
+            # ---------- 3) ВЫПЛАТЫ СЕГОДНЯ ----------
+            if arr and (arr.astimezone(ALMATY_TZ).date() + timedelta(days=1) == today):
+                contract_sum = round(cost / 100)          # сумма контракта (без 1.12)
+                payout_sum = round(contract_sum * 0.97)   # минус 3%
                 payouts_today.append((row, payout_sum))
                 total_payout += payout_sum
 
-        # ---------- ФОРМИРОВАНИЕ СООБЩЕНИЯ ----------
-
+        # ---------- Message ----------
         msg = f"📊 <b>Ежедневная сводка за {yesterday.strftime('%d.%m.%Y')}</b>\n\n"
-
         msg += f"📌 <b>Бронирований за вчера:</b> {len(bookings_yesterday)}\n\n"
 
         msg += "🏨 <b>Предстоящие заезды сегодня:</b>\n"
@@ -262,8 +320,8 @@ def daily_report():
 
                 tenant = extract_person(tenant_info)
                 landlord = extract_person(landlord_info)
-                price = format_price(cost)  # тут гостевая цена, как и раньше
-                link = get_apartment_link(ap_id)
+                price = format_price(cost)
+                link = get_apartment_link(cur, ap_id)
                 link_line = f'\n      🔗 <a href="{link}">Открыть объявление</a>' if link else ""
 
                 msg += (
@@ -279,12 +337,11 @@ def daily_report():
         msg += "💵 <b>Выплаты сегодня:</b>\n"
         if payouts_today:
             for idx, (row, payout_sum) in enumerate(payouts_today, 1):
-                (_, cost, arr, dep, ad, tenant_info, landlord_info, ap_id) = row
+                (cid, cost, arr, dep, ad, tenant_info, landlord_info, ap_id) = row
                 ad_title = (ad or {}).get("title", "Квартира")
                 city = (ad or {}).get("address", {}).get("city", "")
 
-                landlord = extract_person(landlord_info)  # <<< добавили владельца
-
+                landlord = extract_person(landlord_info)
                 msg += (
                     f"{idx}) <b>{ad_title}</b> — {city}\n"
                     f"   🏡 Собственник: <b>{landlord['name']}</b>  | 📞 {landlord['phone']}\n"
@@ -296,13 +353,10 @@ def daily_report():
 
         send(msg)
 
+    try:
+        with_db(_run)
     except Exception as e:
         print("Daily report error:", e)
-
-
-def now_almaty():
-    # Алматы = UTC+5
-    return now_utc() + timedelta(hours=5)
 
 
 def schedule_daily_report():
@@ -319,74 +373,90 @@ def schedule_daily_report():
         daily_report()
 
 
-# Запускаем отдельным фоном
-threading.Thread(target=schedule_daily_report, daemon=True).start()
-
-print("Booking notifier started...")
+def send_missed_report_on_start():
+    # If bot starts after 09:00 Almaty — send yesterday report immediately.
+    # Without DB-state this can duplicate on multiple restarts, but prevents missing.
+    now = datetime.now(ALMATY_TZ)
+    if now.hour >= 9:
+        print("Startup: after 09:00, sending daily report (catch-up)")
+        daily_report()
 
 
 # ===================================
 # MAIN LOOP
 # ===================================
 
+print("Booking notifier started...")
+
+send_missed_report_on_start()
+threading.Thread(target=schedule_daily_report, daemon=True).start()
+
+last_request_mark = None   # for contract_requests
+last_contract_mark = None  # for contracts
+
+
 while True:
-    # =====================================================
-    # 1) contract_requests (заявки)
-    # =====================================================
-    cur.execute("""
-        SELECT 
-            r.id,
-            r.status,
-            r.cost,
-            r."arrivalDate",
-            r."departureDate",
-            r."baseApartmentAdData",
-            r."tenantId",
-            r."tenantInformation",
-            r."landlordInformation",
-            r."apartmentAdId",
-            r."createdAt",
-            r."updatedAt"
-        FROM contract_requests r
-        ORDER BY r."updatedAt" DESC
-        LIMIT 1;
-    """)
+    try:
+        def _iteration(cur):
+            global last_request_mark, last_contract_mark
 
-    req = cur.fetchone()
+            # =====================================================
+            # 1) contract_requests (заявки)
+            # =====================================================
+            cur.execute(
+                """
+                SELECT 
+                    r.id,
+                    r.status,
+                    r.cost,
+                    r."arrivalDate",
+                    r."departureDate",
+                    r."baseApartmentAdData",
+                    r."tenantId",
+                    r."tenantInformation",
+                    r."landlordInformation",
+                    r."apartmentAdId",
+                    r."createdAt",
+                    r."updatedAt"
+                FROM contract_requests r
+                ORDER BY r."updatedAt" DESC
+                LIMIT 1;
+                """
+            )
+            req = cur.fetchone()
 
-    if req:
-        (
-            req_id,
-            status,
-            cost,
-            arrival,
-            departure,
-            ad_info,
-            tenant_id,
-            tenant_info_json,
-            landlord_info_json,
-            apartment_ad_id,
-            created_at,
-            updated_at
-        ) = req
+            if req:
+                (
+                    req_id,
+                    status,
+                    cost,
+                    arrival,
+                    departure,
+                    ad_info,
+                    tenant_id,
+                    tenant_info_json,
+                    landlord_info_json,
+                    apartment_ad_id,
+                    created_at,
+                    updated_at,
+                ) = req
 
-        current_mark = f"{req_id}:{status}"
-        if last_request_mark is None:
-            last_request_mark = current_mark
-        elif current_mark != last_request_mark:
+                current_mark = f"{req_id}:{status}"
+                if last_request_mark is None:
+                    last_request_mark = current_mark
+                elif current_mark != last_request_mark:
+                    ad_title = (ad_info or {}).get("title", "Квартира")
+                    city = (ad_info or {}).get("address", {}).get("city", "")
 
-            ad_title = (ad_info or {}).get("title", "Квартира")
-            city = (ad_info or {}).get("address", {}).get("city", "")
+                    tenant = extract_person(tenant_info_json, cur=cur, fallback_user_id=tenant_id)
+                    landlord = extract_person(landlord_info_json)
 
-            tenant = extract_person(tenant_info_json, fallback_user_id=tenant_id)
-            landlord = extract_person(landlord_info_json)
+                    price = format_price(cost)
+                    link = get_apartment_link(cur, apartment_ad_id)
+                    link_line = f'\n🔗 <a href="{link}">Открыть объявление</a>' if link else ""
 
-            price = format_price(cost)
-            link = get_apartment_link(apartment_ad_id)
-            link_line = f'\n🔗 <a href="{link}">Открыть объявление</a>' if link else ""
-
-            if status == "CREATED":
-                send(f"""
+                    if status == "CREATED":
+                        send(f"""
 ✉️ <b>Заявка отправлена</b>
 🕒 Создано: <b>{to_almaty(created_at)}</b>
 
@@ -403,8 +473,8 @@ while True:
 💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
-            elif status == "ACCEPTED":
-                send(f"""
+                    elif status == "ACCEPTED":
+                        send(f"""
 ✅ <b>Заявка принята собственником</b>
 🕒 Создано: <b>{to_almaty(created_at)}</b>
 🕒 Обновлено: <b>{to_almaty(updated_at)}</b>
@@ -422,8 +492,8 @@ while True:
 💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
-            elif status == "REJECTED":
-                send(f"""
+                    elif status == "REJECTED":
+                        send(f"""
 ❌ <b>Заявка отклонена</b>
 🕒 Создано: <b>{to_almaty(created_at)}</b>
 🕒 Обновлено: <b>{to_almaty(updated_at)}</b>
@@ -441,99 +511,95 @@ while True:
 💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
-            last_request_mark = current_mark
+                    last_request_mark = current_mark
 
-    # =====================================================
-    # 2) contracts (оплаченные / активные / завершённые)
-    # =====================================================
+            # =====================================================
+            # 2) contracts (оплаченные / активные / завершённые)
+            # =====================================================
+            cur.execute(
+                """
+                SELECT
+                    c.id,
+                    c.status,
+                    c.cost,
+                    c."arrivalDate",
+                    c."departureDate",
+                    c."baseApartmentAdData",
+                    c."tenantId",
+                    c."landlordId",
+                    c."tenantInformation",
+                    c."landlordInformation",
+                    c."apartmentAdId",
+                    c."createdAt",
+                    c."updatedAt",
+                    c."isPaymentSuccess",
+                    c."payedAt",
+                    c."retryPaymentAttempts"
+                FROM contracts c
+                ORDER BY c."updatedAt" DESC
+                LIMIT 1;
+                """
+            )
+            contract = cur.fetchone()
 
-    cur.execute("""
-        SELECT
-            c.id,
-            c.status,
-            c.cost,
-            c."arrivalDate",
-            c."departureDate",
-            c."baseApartmentAdData",
-            c."tenantId",
-            c."landlordId",
-            c."tenantInformation",
-            c."landlordInformation",
-            c."apartmentAdId",
-            c."createdAt",
-            c."updatedAt",
-            c."isPaymentSuccess",
-            c."payedAt",
-            c."retryPaymentAttempts"
-        FROM contracts c
-        ORDER BY c."updatedAt" DESC
-        LIMIT 1;
-    """)
+            if contract:
+                (
+                    c_id,
+                    c_status,
+                    c_cost,
+                    c_arrival,
+                    c_departure,
+                    c_ad,
+                    tenant_id,
+                    landlord_id,
+                    c_tenant_info,
+                    c_landlord_info,
+                    c_apartment_ad_id,
+                    c_created,
+                    c_updated,
+                    c_is_payment_success,
+                    c_payed_at,
+                    c_retry_payment_attempts,
+                ) = contract
 
-    contract = cur.fetchone()
+                c_retry_payment_attempts = c_retry_payment_attempts or 0
 
-    if contract:
-        (
-            c_id,
-            c_status,
-            c_cost,
-            c_arrival,
-            c_departure,
-            c_ad,
-            tenant_id,
-            landlord_id,
-            c_tenant_info,
-            c_landlord_info,
-            c_apartment_ad_id,
-            c_created,
-            c_updated,
-            c_is_payment_success,
-            c_payed_at,
-            c_retry_payment_attempts,
-        ) = contract
+                completed_ready = int(
+                    c_status == "COMPLETED"
+                    and c_departure is not None
+                    and now_utc() >= c_departure
+                )
 
-        c_retry_payment_attempts = c_retry_payment_attempts or 0
+                current_mark = (
+                    f"{c_id}:"
+                    f"{c_status}:"
+                    f"{int(bool(c_is_payment_success))}:"
+                    f"{int(bool(c_payed_at))}:"
+                    f"{int(c_retry_payment_attempts)}:"
+                )
+                if c_status == "COMPLETED":
+                    current_mark += f"{int(completed_ready)}"
 
-        # флаг: пора ли уже считать проживание завершённым по времени
-        completed_ready = int(
-            c_status == "COMPLETED"
-            and c_departure is not None
-            and now_utc() >= c_departure
-        )
+                if last_contract_mark is None:
+                    last_contract_mark = current_mark
+                elif current_mark != last_contract_mark:
 
-        # учитываем статус, факт оплаты, количество попыток и то, прошёл ли departureDate
-        current_mark = (
-            f"{c_id}:"
-            f"{c_status}:"
-            f"{int(bool(c_is_payment_success))}:"
-            f"{int(bool(c_payed_at))}:"
-            f"{int(c_retry_payment_attempts)}:"
-        )
+                    # OFFERING skip
+                    if c_status == "OFFERING":
+                        last_contract_mark = current_mark
+                        return
 
-        if c_status == "COMPLETED":
-            current_mark += f"{int(completed_ready)}"
+                    tenant = extract_person(c_tenant_info, cur=cur, fallback_user_id=tenant_id)
+                    landlord = extract_person(c_landlord_info, cur=cur, fallback_user_id=landlord_id)
 
-        if last_contract_mark is None:
-            last_contract_mark = current_mark
-        elif current_mark != last_contract_mark:
+                    title = (c_ad or {}).get("title", "Квартира")
+                    city = (c_ad or {}).get("address", {}).get("city", "")
+                    price = format_price(c_cost)
+                    link = get_apartment_link(cur, c_apartment_ad_id)
+                    link_line = f'\n🔗 <a href="{link}">Открыть объявление</a>' if link else ""
 
-            # OFFERING не используем
-            if c_status == "OFFERING":
-                last_contract_mark = current_mark
-                time.sleep(CHECK_INTERVAL)
-                continue
-
-            tenant = extract_person(c_tenant_info, fallback_user_id=tenant_id)
-            landlord = extract_person(c_landlord_info, fallback_user_id=landlord_id)
-
-            title = (c_ad or {}).get("title", "Квартира")
-            city = (c_ad or {}).get("address", {}).get("city", "")
-            price = format_price(c_cost)
-            link = get_apartment_link(c_apartment_ad_id)
-            link_line = f'\n🔗 <a href="{link}">Открыть объявление</a>' if link else ""
-
-            if c_status == "CREATED":
-                send(f"""
+                    if c_status == "CREATED":
+                        send(f"""
 📄 <b>Контракт создан</b>
 🕒 {to_almaty(c_created)}
 
@@ -550,10 +616,9 @@ while True:
 💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
-            elif c_status == "CONCLUDED":
-                if c_is_payment_success and c_payed_at:
-                    # успешная оплата
-                    send(f"""
+                    elif c_status == "CONCLUDED":
+                        if c_is_payment_success and c_payed_at:
+                            send(f"""
 💳 <b>Бронь оплачена</b>
 🕒 Создано: <b>{to_almaty(c_created)}</b>
 🕒 Оплачено: <b>{to_almaty(c_payed_at)}</b>
@@ -571,9 +636,8 @@ while True:
 💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
-                elif (not c_is_payment_success) and c_retry_payment_attempts == 0:
-                    # первая автопопытка списания сразу после принятия не удалась
-                    send(f"""
+                        elif (not c_is_payment_success) and c_retry_payment_attempts == 0:
+                            send(f"""
 💥 <b>Оплата не прошла</b>
 Первая попытка списания после принятия заявки закончилась неуспешно.
 
@@ -590,9 +654,8 @@ while True:
 💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
-                elif (not c_is_payment_success) and c_retry_payment_attempts >= 1:
-                    # повторные попытки оплаты тоже не удались
-                    send(f"""
+                        elif (not c_is_payment_success) and c_retry_payment_attempts >= 1:
+                            send(f"""
 💥 <b>Повторная оплата не прошла</b>
 Попыток оплаты: <b>{c_retry_payment_attempts}</b>
 
@@ -608,12 +671,10 @@ while True:
 📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
 💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
-                # если статус CONCLUDED, но ни успеха, ни ошибки — ничего не шлём
 
-            elif c_status == "COMPLETED":
-                # отправляем только когда по времени уже можно
-                if completed_ready:
-                    send(f"""
+                    elif c_status == "COMPLETED":
+                        if completed_ready:
+                            send(f"""
 🏁 <b>Проживание завершено</b>
 🕒 {to_almaty(c_updated)}
 
@@ -624,15 +685,14 @@ while True:
 📞 {tenant['phone']}
 
 🏡 Собственник: <b>{landlord['name']}</b>
-📞 {landlord['phone']}{link_line}
+📞 {landlord['phone']}
 
 📅 {fmt_date(c_arrival)} → {fmt_date(c_departure)}
 💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
-            elif c_status == "REJECTED":
-                # финальный кейс: контракт не состоится
-                send(f"""
+                    elif c_status == "REJECTED":
+                        send(f"""
 ❌ <b>Контракт отменён</b>
 🕒 {to_almaty(c_updated)}
 
@@ -649,14 +709,14 @@ while True:
 💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
-            elif c_status == "FREEZE":
-                send(f"""
+                    elif c_status == "FREEZE":
+                        send(f"""
 🧊 <b>Контракт заморожен</b>
 🕒 {to_almaty(c_updated)}
 
 ID: {c_id}
 
-🏠 {title}{link_line}
+🏠 {title}
 🌆 {city}
 
 👤 Гость: <b>{tenant['name']}</b>
@@ -669,7 +729,12 @@ ID: {c_id}
 💰 Цена: <b>{price:,} ₸</b>{link_line}
 """)
 
-            # в конце обновляем маркер
-            last_contract_mark = current_mark
+                    last_contract_mark = current_mark
+
+        with_db(_iteration, retries=3)
+
+    except Exception as e:
+        # Never crash the process (avoid Railway restarts due to unhandled exceptions)
+        print("Main loop error:", e)
 
     time.sleep(CHECK_INTERVAL)
